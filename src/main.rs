@@ -1,6 +1,6 @@
 extern crate libc;
 use std::os::unix::net::UnixStream;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::io::{Result, Error, Read, Write};
 use std::fs::File;
 use std::vec::Vec;
@@ -32,24 +32,12 @@ const NBD_CMD_TRIM: u32 = 4;
 const BLOCK_SIZE: u64 = 4096;
 const DEVICE_SIZE: u64 = 3 * 1024 * 1024 * 1024 / 2;
 
-fn socketpair() -> Result<(UnixStream, UnixStream)> {
-    let mut socks = [0 as libc::c_int; 2];
-    unsafe {
-        if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, socks.as_mut_ptr()) != 0 {
-            return Err(Error::last_os_error());
-        }
-        let client_sock = UnixStream::from_raw_fd(socks[0]);
-        let server_sock = UnixStream::from_raw_fd(socks[1]);
-        Ok((client_sock, server_sock))
-    }
-}
-
 struct NBD {
     _nbd: File,
     _client_sock: UnixStream,
     server_sock: UnixStream,
     mem: Vec<u8>,
-    th: thread::JoinHandle<libc::c_int>,
+    _th: thread::JoinHandle<libc::c_int>,
 }
 
 #[derive(Debug)]
@@ -83,7 +71,7 @@ impl NBD {
                libc::ioctl(fd, NBD_SET_SIZE_BLOCKS, DEVICE_SIZE / BLOCK_SIZE) == -1 {
                 return Err(Error::last_os_error());
             }
-            let (c, s) = socketpair()?;
+            let (c, s) = UnixStream::pair()?;
             if libc::ioctl(fd, NBD_SET_SOCK, c.as_raw_fd() as u64) == -1 {
                 return Err(Error::last_os_error());
 
@@ -97,7 +85,7 @@ impl NBD {
                    _client_sock: c,
                    server_sock: s,
                    mem: v,
-                   th: th,
+                   _th: th,
                })
         }
     }
