@@ -1,12 +1,15 @@
 extern crate libc;
+use std::net;
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::AsRawFd;
-use std::io::{Result, Error, Read, Write};
+use std::io::{Result, Error, Read, Write, ErrorKind};
 use std::fs::File;
 use std::vec::Vec;
 use std::mem::{uninitialized, transmute, size_of};
+use std::ptr;
 use std::slice;
 use std::thread;
+use std::sync::atomic::AtomicPtr;
 
 const NBD_SET_SOCK: u64 = 43776;
 const NBD_SET_BLKSIZE: u64 = 43777;
@@ -33,11 +36,10 @@ const BLOCK_SIZE: u64 = 4096;
 const DEVICE_SIZE: u64 = 3 * 1024 * 1024 * 1024 / 2;
 
 struct NBD {
-    _nbd: File,
+    nbd: File,
     _client_sock: UnixStream,
     server_sock: UnixStream,
     mem: Vec<u8>,
-    _th: thread::JoinHandle<libc::c_int>,
 }
 
 #[derive(Debug)]
@@ -68,7 +70,8 @@ impl NBD {
                 return Err(Error::last_os_error());
             }
             if libc::ioctl(fd, NBD_SET_BLKSIZE, BLOCK_SIZE) == -1 ||
-               libc::ioctl(fd, NBD_SET_SIZE_BLOCKS, DEVICE_SIZE / BLOCK_SIZE) == -1 {
+                libc::ioctl(fd, NBD_SET_SIZE_BLOCKS, DEVICE_SIZE / BLOCK_SIZE) == -1
+            {
                 return Err(Error::last_os_error());
             }
             let (c, s) = UnixStream::pair()?;
@@ -76,17 +79,15 @@ impl NBD {
                 return Err(Error::last_os_error());
 
             }
-            let th = thread::spawn(move || libc::ioctl(fd, NBD_DO_IT));
 
             let mut v = Vec::with_capacity(DEVICE_SIZE as usize);
             v.set_len(DEVICE_SIZE as usize);
             Ok(NBD {
-                   _nbd: f,
-                   _client_sock: c,
-                   server_sock: s,
-                   mem: v,
-                   _th: th,
-               })
+                nbd: f,
+                _client_sock: c,
+                server_sock: s,
+                mem: v,
+            })
         }
     }
 
@@ -96,13 +97,11 @@ impl NBD {
             let p: *mut u8 = transmute(&mut req);
             let buf = slice::from_raw_parts_mut(p, size_of::<nbd_request>());
             self.server_sock.read_exact(buf).unwrap();
-            // todo
             req.magic = u32::from_be(req.magic);
             req.type_ = u32::from_be(req.type_);
             req.from = u64::from_be(req.from);
             req.len = u32::from_be(req.len);
             assert!(req.magic == NBD_REQUEST_MAGIC);
-            //print!("req:\n{:?}\n", req);
             Ok(req)
         }
     }
@@ -144,18 +143,70 @@ impl NBD {
         Ok(true)
     }
 
-    fn run(&mut self) {
-        loop {
-            let req = self.recv_req().unwrap();
-            if !self.process_req(req).unwrap() {
-                return;
+    fn start_thread(&mut self) -> thread::JoinHandle<()> {
+        let p = AtomicPtr::new(self);
+        thread::spawn(move || {
+            let mut nbd = unsafe { p.into_inner().as_mut().unwrap() };
+            loop {
+                let req = nbd.recv_req().unwrap();
+                if !nbd.process_req(req).unwrap() {
+                    break;
+                }
+            }
+            nbd.server_sock.shutdown(net::Shutdown::Both).unwrap();
+        })
+    }
+
+    fn run(&mut self) -> Result<()> {
+        let h = self.start_thread();
+        let fd = self.nbd.as_raw_fd();
+        unsafe {
+            if libc::ioctl(fd, NBD_DO_IT) == -1 {
+                return Err(Error::last_os_error());
             }
         }
+        h.join().map_err(
+            |e| Error::new(ErrorKind::Other, format!("{:?}", e)),
+        )
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        let fd = self.nbd.as_raw_fd();
+        unsafe {
+            if libc::ioctl(fd, NBD_DISCONNECT) == -1 {
+                return Err(Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn handle_signal(nbd: &mut NBD) -> Result<thread::JoinHandle<()>> {
+    unsafe {
+        let mut mask = uninitialized::<libc::sigset_t>();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGQUIT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, ptr::null_mut());
+        let fd = libc::signalfd(-1, &mask, 0);
+        if fd == -1 {
+            return Err(Error::last_os_error());
+        }
+        let p = AtomicPtr::new(nbd);
+        Ok(thread::spawn(move || {
+            let mut buf = uninitialized::<libc::signalfd_siginfo>();
+            libc::read(fd, transmute(&mut buf), size_of::<libc::signalfd_siginfo>());
+            let mut nbd = p.into_inner().as_mut().unwrap();
+            nbd.stop().unwrap();
+        }))
     }
 }
 
 fn main() {
     let mut nbd = NBD::init().unwrap();
-    print!("init\n");
-    nbd.run();
+    let h = handle_signal(&mut nbd).unwrap();
+    print!("start\n");
+    nbd.run().unwrap();
+    h.join().unwrap();
 }
