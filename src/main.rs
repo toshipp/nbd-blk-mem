@@ -57,16 +57,31 @@ struct nbd_reply {
 }
  */
 
+fn pipe() -> (i32, i32) {
+    let mut fds = [0i32; 2];
+    unsafe {
+        if libc::pipe((&mut fds).as_mut_ptr()) == -1 {
+            panic!();
+        }
+    }
+    (fds[1], fds[0])
+}
+
 struct Handler {
     sock: UnixStream,
+    pipe_in: i32,
+    pipe_out: i32,
     p: *mut u8,
     l: usize,
 }
 
 impl Handler {
     fn new<'a>(sock: UnixStream, mem: &'a mut [u8]) -> Handler {
+        let (pin, pout) = pipe();
         Handler {
             sock: sock,
+            pipe_in: pin,
+            pipe_out: pout,
             p: mem.as_mut_ptr(),
             l: mem.len(),
         }
@@ -88,11 +103,42 @@ impl Handler {
     }
 
     fn process_read(&mut self, req: nbd_request) -> Result<()> {
-        let begin = req.from as usize;
-        let end = begin + req.len as usize;
+        let from = req.from as usize;
+        let len = req.len as usize;
         self.send_header(req)?;
-        let s = unsafe { slice::from_raw_parts(self.p, self.l) };
-        self.sock.write_all(&s[begin..end])?;
+        if true {
+            let mut written = 0;
+            while written < len {
+                unsafe {
+                    let iov = libc::iovec {
+                        iov_base: self.p.offset((from + written) as isize) as *mut libc::c_void,
+                        iov_len: len - written,
+                    };
+                    if libc::vmsplice(self.pipe_in, &iov, 1, libc::SPLICE_F_GIFT) == -1 {
+                        print!("vmsplice\n");
+                        return Err(Error::last_os_error());
+                    }
+                    let ret = libc::splice(
+                        self.pipe_out,
+                        ptr::null_mut(),
+                        self.sock.as_raw_fd(),
+                        ptr::null_mut(),
+                        len - written,
+                        libc::SPLICE_F_MOVE,
+                    );
+                    if ret == -1 {
+                        print!("splice\n");
+                        return Err(Error::last_os_error());
+                    };
+                    written += ret as usize;
+                }
+            }
+        } else {
+            let begin = from;
+            let end = begin + len;
+            let s = unsafe { slice::from_raw_parts(self.p, self.l) };
+            self.sock.write_all(&s[begin..end])?;
+        }
         Ok(())
     }
 
