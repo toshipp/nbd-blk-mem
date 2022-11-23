@@ -1,16 +1,16 @@
 extern crate libc;
-use std::net;
-use std::os::unix::net::UnixStream;
-use std::os::unix::io::AsRawFd;
-use std::io::{Result, Error, Read, Write, ErrorKind};
+use std::env;
 use std::fs::File;
-use std::vec::Vec;
-use std::mem::{uninitialized, transmute, size_of};
+use std::io::{Error, ErrorKind, Read, Result, Write};
+use std::mem::{size_of, transmute, MaybeUninit};
+use std::net;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::slice;
-use std::thread;
 use std::sync::atomic::AtomicPtr;
-use std::env;
+use std::thread;
+use std::vec::Vec;
 
 const NBD_SET_SOCK: u64 = 43776;
 const NBD_SET_BLKSIZE: u64 = 43777;
@@ -27,7 +27,7 @@ const NBD_SET_FLAGS: u64 = 43786;
 const NBD_REQUEST_MAGIC: u32 = 0x25609513;
 const NBD_REPLY_MAGIC: [u8; 4] = [0x67, 0x44, 0x66, 0x98];
 
-const NBD_FLAG_CAN_MULTI_CONN: u64 = (1 << 8);
+const NBD_FLAG_CAN_MULTI_CONN: u64 = 1 << 8;
 
 const NBD_CMD_READ: u32 = 0;
 const NBD_CMD_WRITE: u32 = 1;
@@ -38,10 +38,9 @@ const NBD_CMD_TRIM: u32 = 4;
 const BLOCK_SIZE: u64 = 4096;
 const DEVICE_SIZE: u64 = 3 * 1024 * 1024 * 1024 / 2;
 
-#[derive(Debug)]
 #[repr(C)]
 #[repr(packed)]
-struct nbd_request {
+struct NBDRequest {
     magic: u32,
     type_: u32,
     handle: [u8; 8],
@@ -66,28 +65,30 @@ struct Handler {
 impl Handler {
     fn new<'a>(sock: UnixStream, mem: &'a mut [u8]) -> Handler {
         Handler {
-            sock: sock,
+            sock,
             p: mem.as_mut_ptr(),
             l: mem.len(),
         }
     }
 
-    fn recv_req(&mut self) -> Result<nbd_request> {
+    fn recv_req(&mut self) -> Result<NBDRequest> {
         unsafe {
-            let mut req = uninitialized::<nbd_request>();
-            let p: *mut u8 = transmute(&mut req);
-            let buf = slice::from_raw_parts_mut(p, size_of::<nbd_request>());
+            //            MaybeUninit::uninit();
+            let mut req = MaybeUninit::<NBDRequest>::uninit();
+            let req_ref = &mut *req.as_mut_ptr();
+            let p: *mut u8 = transmute(req.as_mut_ptr());
+            let buf = slice::from_raw_parts_mut(p, size_of::<NBDRequest>());
             self.sock.read_exact(buf).unwrap();
-            req.magic = u32::from_be(req.magic);
-            req.type_ = u32::from_be(req.type_);
-            req.from = u64::from_be(req.from);
-            req.len = u32::from_be(req.len);
-            assert!(req.magic == NBD_REQUEST_MAGIC);
-            Ok(req)
+            req_ref.magic = u32::from_be(req_ref.magic);
+            req_ref.type_ = u32::from_be(req_ref.type_);
+            req_ref.from = u64::from_be(req_ref.from);
+            req_ref.len = u32::from_be(req_ref.len);
+            assert!(req_ref.magic == NBD_REQUEST_MAGIC);
+            Ok(req.assume_init())
         }
     }
 
-    fn process_read(&mut self, req: nbd_request) -> Result<()> {
+    fn process_read(&mut self, req: NBDRequest) -> Result<()> {
         let begin = req.from as usize;
         let end = begin + req.len as usize;
         self.send_header(req)?;
@@ -96,7 +97,7 @@ impl Handler {
         Ok(())
     }
 
-    fn process_write(&mut self, req: nbd_request) -> Result<()> {
+    fn process_write(&mut self, req: NBDRequest) -> Result<()> {
         let begin = req.from as usize;
         let end = begin + req.len as usize;
         let s = unsafe { slice::from_raw_parts_mut(self.p, self.l) };
@@ -105,7 +106,7 @@ impl Handler {
         Ok(())
     }
 
-    fn send_header(&mut self, req: nbd_request) -> Result<()> {
+    fn send_header(&mut self, req: NBDRequest) -> Result<()> {
         self.sock.write_all(&NBD_REPLY_MAGIC)?;
         let error = [0u8; 4];
         self.sock.write_all(&error)?;
@@ -114,14 +115,17 @@ impl Handler {
     }
 
     /// false to finish.
-    fn process_req(&mut self, req: nbd_request) -> Result<bool> {
+    fn process_req(&mut self, req: NBDRequest) -> Result<bool> {
         match req.type_ {
             NBD_CMD_READ => self.process_read(req)?,
             NBD_CMD_WRITE => self.process_write(req)?,
             NBD_CMD_DISC => return Ok(false),
             NBD_CMD_FLUSH => self.send_header(req)?,
             NBD_CMD_TRIM => self.send_header(req)?,
-            _ => panic!("unknown type: {}", req.type_),
+            _ => {
+                let t = req.type_;
+                panic!("unknown type: {}", t);
+            }
         }
         Ok(true)
     }
@@ -129,7 +133,7 @@ impl Handler {
     fn start_thread(&mut self) -> thread::JoinHandle<()> {
         let p = AtomicPtr::new(self);
         thread::spawn(move || {
-            let mut h = unsafe { p.into_inner().as_mut().unwrap() };
+            let h = unsafe { p.into_inner().as_mut().unwrap() };
             loop {
                 let req = h.recv_req().unwrap();
                 if !h.process_req(req).unwrap() {
@@ -164,8 +168,8 @@ impl NBD {
             if libc::ioctl(fd, NBD_SET_FLAGS, NBD_FLAG_CAN_MULTI_CONN) == -1 {
                 return Err(Error::last_os_error());
             }
-            if libc::ioctl(fd, NBD_SET_BLKSIZE, BLOCK_SIZE) == -1 ||
-                libc::ioctl(fd, NBD_SET_SIZE_BLOCKS, DEVICE_SIZE / BLOCK_SIZE) == -1
+            if libc::ioctl(fd, NBD_SET_BLKSIZE, BLOCK_SIZE) == -1
+                || libc::ioctl(fd, NBD_SET_SIZE_BLOCKS, DEVICE_SIZE / BLOCK_SIZE) == -1
             {
                 return Err(Error::last_os_error());
             }
@@ -174,12 +178,10 @@ impl NBD {
                 let (c, s) = UnixStream::pair()?;
                 if libc::ioctl(fd, NBD_SET_SOCK, c.as_raw_fd() as u64) == -1 {
                     return Err(Error::last_os_error());
-
                 }
                 cv.push(c);
                 hv.push(Handler::new(s, &mut mem[..]));
             }
-
 
             Ok(NBD {
                 nbd: f,
@@ -202,11 +204,9 @@ impl NBD {
 
         let mut ret = Ok(());
         for r in jhs.into_iter().map(|jh| {
-            jh.join().map_err(|e| {
-                Error::new(ErrorKind::Other, format!("{:?}", e))
-            })
-        })
-        {
+            jh.join()
+                .map_err(|e| Error::new(ErrorKind::Other, format!("{:?}", e)))
+        }) {
             if r.is_err() {
                 ret = r;
             }
@@ -227,21 +227,25 @@ impl NBD {
 
 fn handle_signal(nbd: &mut NBD) -> Result<thread::JoinHandle<()>> {
     unsafe {
-        let mut mask = uninitialized::<libc::sigset_t>();
-        libc::sigemptyset(&mut mask);
-        libc::sigaddset(&mut mask, libc::SIGINT);
-        libc::sigaddset(&mut mask, libc::SIGTERM);
-        libc::sigaddset(&mut mask, libc::SIGQUIT);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, ptr::null_mut());
-        let fd = libc::signalfd(-1, &mask, 0);
+        let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(mask.as_mut_ptr());
+        libc::sigaddset(mask.as_mut_ptr(), libc::SIGINT);
+        libc::sigaddset(mask.as_mut_ptr(), libc::SIGTERM);
+        libc::sigaddset(mask.as_mut_ptr(), libc::SIGQUIT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, mask.as_ptr(), ptr::null_mut());
+        let fd = libc::signalfd(-1, mask.as_ptr(), 0);
         if fd == -1 {
             return Err(Error::last_os_error());
         }
         let p = AtomicPtr::new(nbd);
         Ok(thread::spawn(move || {
-            let mut buf = uninitialized::<libc::signalfd_siginfo>();
-            libc::read(fd, transmute(&mut buf), size_of::<libc::signalfd_siginfo>());
-            let mut nbd = p.into_inner().as_mut().unwrap();
+            let mut buf = MaybeUninit::<libc::signalfd_siginfo>::uninit();
+            libc::read(
+                fd,
+                transmute(buf.as_mut_ptr()),
+                size_of::<libc::signalfd_siginfo>(),
+            );
+            let nbd = p.into_inner().as_mut().unwrap();
             nbd.stop().unwrap();
         }))
     }
