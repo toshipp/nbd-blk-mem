@@ -36,7 +36,7 @@ const NBD_CMD_FLUSH: u32 = 3;
 const NBD_CMD_TRIM: u32 = 4;
 
 const BLOCK_SIZE: u64 = 4096;
-const DEVICE_SIZE: u64 = 3 * 1024 * 1024 * 1024 / 2;
+const DEVICE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 #[repr(C)]
 #[repr(packed)]
